@@ -122,6 +122,7 @@ st.sidebar.markdown("### ⚙️ Configuración y Filtros")
 openai_key = os.getenv("OPENAI_API_KEY", "")
 if openai_key == "tu_api_key_de_openai_aqui":
     openai_key = ""
+tactical_agent = TacticalFootballAgent(api_key=openai_key)
 
 # 1. Selección de Fuente de Datos
 local_csv_files = sorted(
@@ -526,7 +527,7 @@ else:
             st.markdown("#### 🤖 Análisis Táctico con Inteligencia Artificial")
             st.markdown("Presiona el botón para generar un informe detallado comparando los estilos y encajes tácticos de ambos jugadores.")
             
-            # Botón para disparar llamada a OpenAI
+            # Botón para solicitar el reporte al agente táctico
             generate_report = st.button("🧠 Generar Reporte de Scouting IA")
             
             if generate_report:
@@ -534,7 +535,7 @@ else:
                     st.warning("⚠️ Se requiere una **OpenAI API Key** para esta función. Configura `OPENAI_API_KEY` en el archivo `.env`.")
                 else:
                     with st.spinner(f"Analizando perfiles de {target_name} y {compare_player_name}..."):
-                        report_text = TacticalFootballAgent(openai_key).generate_report(
+                        report_text = tactical_agent.generate_report(
                             player_a=target_row,
                             player_b=compare_row,
                             feature_cols=recommender.feature_cols,
