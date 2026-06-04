@@ -67,6 +67,11 @@ class PlayerDatasetNormalizer:
         for column in ("player", "team", "league", "position", "season"):
             normalized[column] = normalized[column].fillna("N/A").astype(str).str.strip()
 
+        if "age" in normalized.columns:
+            normalized["age"] = normalized["age"].apply(cls._normalize_age)
+        if "nation" in normalized.columns:
+            normalized["nation"] = normalized["nation"].apply(cls._normalize_nation)
+
         normalized["league"] = normalized["league"].str.replace(
             r"^[a-z]{2,3}\s+", "", regex=True
         )
@@ -121,10 +126,30 @@ class PlayerDatasetNormalizer:
         return result
 
     @staticmethod
+    def _normalize_age(value) -> str:
+        if pd.isna(value):
+            return "N/A"
+
+        numeric_value = pd.to_numeric(value, errors="coerce")
+        if pd.notna(numeric_value) and float(numeric_value).is_integer():
+            return str(int(numeric_value))
+        return str(value).strip()
+
+    @staticmethod
+    def _normalize_nation(value) -> str:
+        if pd.isna(value):
+            return "N/A"
+
+        uppercase_codes = re.findall(r"\b[A-Z]{2,}\b", str(value))
+        return " ".join(uppercase_codes) or "N/A"
+
+    @staticmethod
     def _convert_numeric_like_columns(df: pd.DataFrame) -> pd.DataFrame:
         converted = df.copy()
         for column in converted.select_dtypes(include="object").columns:
-            if column in {"player", "team", "league", "position", "season", "nation"}:
+            if column in {
+                "player", "team", "league", "position", "season", "age", "nation"
+            }:
                 continue
             numeric = pd.to_numeric(converted[column], errors="coerce")
             non_null_count = converted[column].notna().sum()

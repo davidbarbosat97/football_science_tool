@@ -112,6 +112,7 @@ La aplicación adapta automáticamente nombres de columnas habituales en españo
 | Partidos | `matches`, `MP`, `apps`, `partidos` |
 
 `age`, `born`, `nation` y `season` son opcionales. Si no existe `season`, se utiliza el valor indicado al subir el archivo.
+Las edades se muestran como números enteros y, en campos como `es ESP`, la nacionalidad se normaliza al código en mayúsculas (`ESP`).
 
 Para seleccionar métricas estadísticas, el sistema:
 
