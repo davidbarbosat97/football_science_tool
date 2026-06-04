@@ -3,7 +3,10 @@ import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 import os
+from io import BytesIO
 from dotenv import load_dotenv
+from agents.tactical_football_agent import TacticalFootballAgent
+from src.data_loader import DatasetValidationError, PlayerDatasetNormalizer
 from src.scraper import get_scraper
 from src.recommender import PlayerRecommender
 
@@ -120,22 +123,24 @@ openai_key = os.getenv("OPENAI_API_KEY", "")
 if openai_key == "tu_api_key_de_openai_aqui":
     openai_key = ""
 
-# 1. Selección de Proveedor de Datos
-provider = st.sidebar.selectbox(
-    "📊 Proveedor de Datos",
-    options=["Understat", "FBref"],
+# 1. Selección de Fuente de Datos
+local_csv_files = sorted(
+    os.path.join("data", filename)
+    for filename in os.listdir("data")
+    if filename.lower().endswith(".csv")
+) if os.path.isdir("data") else []
+data_source_options = ["Understat"]
+if local_csv_files:
+    data_source_options.append("CSV local")
+data_source_options.append("CSV personalizado")
+
+data_source = st.sidebar.selectbox(
+    "📊 Fuente de Datos",
+    options=data_source_options,
     index=0,
-    help="Understat es rápido y robusto ante bloqueos de scraping. FBref ofrece más métricas pero puede dar errores 403 Forbidden debido a protecciones anti-bot."
+    help="Understat descarga datos automáticamente. También puedes utilizar un CSV guardado en data/ o subir otro archivo."
 )
 
-# 2. Selección de Temporada
-season = st.sidebar.selectbox(
-    "📅 Temporada",
-    options=["2025-26", "2024-25", "2023-24"],
-    index=0
-)
-
-# 3. Filtro de ligas a descargar/incluir
 all_leagues = [
     "ENG-Premier League",
     "ESP-La Liga",
@@ -143,11 +148,40 @@ all_leagues = [
     "GER-Bundesliga",
     "FRA-Ligue 1"
 ]
-selected_leagues = st.sidebar.multiselect(
-    "🏆 Ligas a Incluir",
-    options=all_leagues,
-    default=all_leagues
-)
+
+local_csv_path = None
+if data_source == "Understat":
+    season = st.sidebar.selectbox(
+        "📅 Temporada",
+        options=["2025-26", "2024-25", "2023-24"],
+        index=0
+    )
+    selected_leagues = st.sidebar.multiselect(
+        "🏆 Ligas a Incluir",
+        options=all_leagues,
+        default=all_leagues
+    )
+    uploaded_csv = None
+    csv_season = "CSV"
+elif data_source == "CSV local":
+    local_csv_path = st.sidebar.selectbox(
+        "📁 Base de datos local",
+        options=local_csv_files,
+        format_func=os.path.basename,
+    )
+    uploaded_csv = None
+    csv_season = st.sidebar.text_input("📅 Temporada del CSV", value="2024-25")
+    selected_leagues = []
+    season = csv_season
+else:
+    uploaded_csv = st.sidebar.file_uploader(
+        "📁 Base de datos de jugadores",
+        type=["csv"],
+        help="Debe incluir jugador, equipo, liga, posición, minutos y partidos. Se reconocen aliases habituales en español e inglés."
+    )
+    csv_season = st.sidebar.text_input("📅 Temporada del CSV", value="CSV")
+    selected_leagues = []
+    season = csv_season
 
 # 4. Slider de minutos mínimos (Porcentaje)
 min_mins_pct = st.sidebar.slider(
@@ -159,7 +193,11 @@ min_mins_pct = st.sidebar.slider(
     help="Filtra a los jugadores que no alcancen este porcentaje de los minutos máximos jugados en su liga para evitar anomalías estadísticas."
 )
 
-force_reload = st.sidebar.button("🔄 Recargar Datos de Internet")
+force_reload = (
+    st.sidebar.button("🔄 Recargar Datos de Internet")
+    if data_source == "Understat"
+    else False
+)
 
 st.sidebar.markdown("---")
 st.sidebar.markdown(
@@ -176,21 +214,66 @@ def load_data(prov: str, leagues: list, seas: str, reload: bool = False) -> pd.D
     # Si reload es True, forzamos recarga desde la web
     return scraper.load_season_data(seas, force_refresh=reload)
 
+@st.cache_data(show_spinner=False)
+def load_csv_data(file_bytes: bytes, default_season: str) -> pd.DataFrame:
+    return PlayerDatasetNormalizer.read_csv(
+        BytesIO(file_bytes), default_season=default_season
+    )
+
+@st.cache_data(show_spinner=False)
+def load_local_csv_data(path: str, modified_at: float, default_season: str) -> pd.DataFrame:
+    return PlayerDatasetNormalizer.read_csv(path, default_season=default_season)
+
 # Estado de carga de datos
 with st.spinner("Cargando y procesando la base de datos de futbolistas..."):
     try:
-        df = load_data(provider, selected_leagues, season, reload=force_reload)
+        if data_source == "Understat":
+            df = load_data("Understat", selected_leagues, season, reload=force_reload)
+        elif data_source == "CSV local" and local_csv_path:
+            df = load_local_csv_data(
+                local_csv_path, os.path.getmtime(local_csv_path), csv_season
+            )
+        elif uploaded_csv is not None:
+            df = load_csv_data(uploaded_csv.getvalue(), csv_season)
+        else:
+            df = pd.DataFrame()
+
+        if data_source in {"CSV local", "CSV personalizado"} and not df.empty:
+            csv_seasons = sorted(df["season"].dropna().unique().tolist(), reverse=True)
+            selected_csv_season = st.sidebar.selectbox(
+                "📅 Temporada disponible",
+                options=csv_seasons,
+            )
+            df = df[df["season"] == selected_csv_season].copy()
+            csv_leagues = sorted(df["league"].dropna().unique().tolist())
+            selected_csv_leagues = st.sidebar.multiselect(
+                "🏆 Ligas del CSV",
+                options=csv_leagues,
+                default=csv_leagues,
+            )
+            df = df[df["league"].isin(selected_csv_leagues)].copy()
+    except DatasetValidationError as e:
+        st.error(f"El CSV no tiene un formato compatible: {e}")
+        df = pd.DataFrame()
     except Exception as e:
-        st.error(f"Error al cargar los datos desde {provider}: {e}")
-        st.info("💡 Te recomendamos cambiar al proveedor **Understat** en el menú lateral, ya que es más tolerante a peticiones y no suele ser bloqueado.")
+        st.error(f"Error al cargar los datos desde {data_source}: {e}")
         df = pd.DataFrame()
 
 # --- FLUJO PRINCIPAL DE LA APLICACIÓN ---
 if df.empty:
-    st.warning("⚠️ La base de datos está vacía. Por favor, asegúrate de haber seleccionado al menos una liga y que el proveedor de datos esté accesible.")
+    if data_source == "CSV personalizado" and uploaded_csv is None:
+        st.info("Sube un archivo CSV para comenzar el análisis.")
+    else:
+        st.warning("⚠️ La base de datos está vacía. Comprueba la fuente y los filtros seleccionados.")
 else:
     # Inicializar el recomendador
     recommender = PlayerRecommender(df)
+    st.sidebar.caption(
+        f"{len(recommender.df_processed):,} jugadores · "
+        f"{len(recommender.feature_cols):,} métricas válidas"
+    )
+    with st.sidebar.expander("Métricas detectadas"):
+        st.write(", ".join(recommender.feature_cols))
     
     # Crear opciones formateadas para buscar jugadores
     # "Nombre (Equipo, Liga)" para evitar confusiones de homónimos
@@ -258,6 +341,8 @@ else:
         similar_df = recommender.find_similar_players(
             player_name=target_name,
             team_name=target_team,
+            league_name=target_row["league"],
+            season=target_row["season"],
             min_minutes_pct=min_mins_pct,
             position_filter=pos_filter,
             top_n=50
@@ -334,9 +419,25 @@ else:
                 "xg_chain_per90": "xG Chain",
                 "xg_buildup_per90": "xG Buildup",
             }
+            target_feature_cols = recommender.get_features_for_position(
+                target_row["clean_position"]
+            )
+            default_radar_features = target_feature_cols[:12]
+            if len(target_feature_cols) > 12:
+                selected_radar_features = st.multiselect(
+                    "Métricas visibles en el radar (máximo 12):",
+                    options=target_feature_cols,
+                    default=default_radar_features,
+                    format_func=lambda feat: radar_label_map.get(
+                        feat, recommender.feature_label(feat)
+                    ),
+                    max_selections=12,
+                )
+            else:
+                selected_radar_features = default_radar_features
             radar_features = [
-                (radar_label_map.get(feat, feat.replace("_per90", "")), feat)
-                for feat in recommender.feature_cols
+                (radar_label_map.get(feat, recommender.feature_label(feat)), feat)
+                for feat in selected_radar_features
             ]
             
             # Filtrar métricas que realmente existan en el dataset
@@ -344,6 +445,9 @@ else:
             valid_radar_features = []
             radar_df = recommender.df_processed
             radar_reference_df = recommender.get_filtered_dataset(min_mins_pct)
+            radar_reference_df = radar_reference_df[
+                radar_reference_df["clean_position"] == target_row["clean_position"]
+            ]
             for label, feat in radar_features:
                 if feat in radar_df.columns:
                     valid_radar_labels.append(label)
@@ -430,10 +534,10 @@ else:
                     st.warning("⚠️ Se requiere una **OpenAI API Key** para esta función. Configura `OPENAI_API_KEY` en el archivo `.env`.")
                 else:
                     with st.spinner(f"Analizando perfiles de {target_name} y {compare_player_name}..."):
-                        report_text = recommender.generate_openai_report(
+                        report_text = TacticalFootballAgent(openai_key).generate_report(
                             player_a=target_row,
                             player_b=compare_row,
-                            api_key=openai_key
+                            feature_cols=recommender.feature_cols,
                         )
                         st.markdown(f"""
                         <div class="ia-report-box">

@@ -1,19 +1,15 @@
-import logging
+import re
 
 import pandas as pd
 import numpy as np
 from sklearn.preprocessing import MinMaxScaler
 from sklearn.metrics import pairwise_distances
-from openai import OpenAI
 from typing import Tuple, Optional
-
-logger = logging.getLogger(__name__)
 
 class PlayerRecommender:
     """
     Motor de similitud y recomendación de futbolistas.
-    Preprocesa los datos, calcula métricas por 90 minutos, aplica distancia euclídea
-    e interactúa con OpenAI para el análisis cualitativo.
+    Preprocesa los datos, calcula métricas por 90 minutos y aplica distancia euclídea.
     """
     
     METADATA_COLS = [
@@ -25,11 +21,24 @@ class PlayerRecommender:
         "born": "N/A",
         "nation": "N/A",
     }
+    NON_FEATURE_PREFIXES = (
+        "rk", "rank", "nation", "pos", "comp", "age", "born", "season",
+        "player", "squad", "team", "league", "mp", "matches", "starts",
+        "min", "minutes", "90s",
+    )
+    MIN_FEATURE_COVERAGE = 0.05
+    MIN_POSITION_FEATURE_COVERAGE = 0.5
+    RATE_METRIC_NAMES = {
+        "ppm", "dist", "avglen", "avgdist", "on-off",
+        "g/sh", "g/sot", "npxg/sh", "mn/mp", "mn/start", "mn/sub",
+        "psxg/sot",
+    }
 
     def __init__(self, df: pd.DataFrame):
         self.df_raw = df.copy()
         self.df_processed = pd.DataFrame()
         self.feature_cols = []
+        self.feature_position_coverage = {}
         self.scaler = MinMaxScaler()
         self._prepare_data()
 
@@ -86,39 +95,112 @@ class PlayerRecommender:
         # 3. Filtrar registros con minutos inválidos
         df = df[df["minutes"] > 0].copy()
 
-        # 4. Seleccionar columnas numéricas que representan estadísticas
-        all_cols = df.columns
-        exclude = set(self.METADATA_COLS + ["clean_position"])
-        numeric_stat_cols = [
-            col for col in all_cols 
-            if col not in exclude and pd.api.types.is_numeric_dtype(df[col])
-        ]
+        # 4. Seleccionar estadísticas con cobertura y variabilidad suficientes.
+        numeric_stat_cols = self._select_feature_columns(df)
         
         # 5. Convertir estadísticas brutas a métricas por 90 minutos
         # Evita normalizar columnas de porcentaje (ej. que contengan "%" o "pct" o "rate")
-        df_p90 = df.copy()
+        calculated_features = {}
         self.feature_cols = []
         
         for col in numeric_stat_cols:
             col_lower = col.lower()
-            is_percentage = "%" in col or "pct" in col or "rate" in col or "percent" in col
-            is_average = "avg" in col_lower or "average" in col_lower or "per" in col_lower
+            is_percentage = self._is_rate_metric(col)
+            is_average = "avg" in col_lower or "average" in col_lower
             
             if is_percentage or is_average:
                 # Mantener porcentajes y promedios directamente
                 p90_col_name = col
-                df_p90[p90_col_name] = df[col].fillna(0)
             else:
                 # Calcular por 90 minutos
                 p90_col_name = f"{col}_per90"
-                df_p90[p90_col_name] = (df[col] / (df["minutes"] / 90.0)).fillna(0)
+                calculated_features[p90_col_name] = (
+                    df[col] / (df["minutes"] / 90.0)
+                ).fillna(0)
                 
             self.feature_cols.append(p90_col_name)
+            self.feature_position_coverage[p90_col_name] = (
+                df.assign(_available=df[col].notna())
+                .groupby("clean_position")["_available"]
+                .mean()
+                .to_dict()
+            )
 
+        df_p90 = df.copy()
+        if calculated_features:
+            df_p90 = pd.concat(
+                [df_p90, pd.DataFrame(calculated_features, index=df.index)], axis=1
+            )
         # Reemplazar valores infinitos (por división por cero) por 0
         df_p90[self.feature_cols] = df_p90[self.feature_cols].replace([np.inf, -np.inf], 0).fillna(0)
         
         self.df_processed = df_p90
+
+    def _select_feature_columns(self, df: pd.DataFrame):
+        exclude = set(self.METADATA_COLS + ["clean_position"])
+        selected = []
+        seen_value_signatures = set()
+        for column in df.columns:
+            if column in exclude or not pd.api.types.is_numeric_dtype(df[column]):
+                continue
+            if self._is_administrative_column(column):
+                continue
+            if self._has_explicit_rate_version(column, df.columns):
+                continue
+            values = pd.to_numeric(df[column], errors="coerce")
+            if values.notna().mean() < self.MIN_FEATURE_COVERAGE:
+                continue
+            if values.nunique(dropna=True) <= 1:
+                continue
+            signature = pd.util.hash_pandas_object(values, index=False).values.tobytes()
+            if signature in seen_value_signatures:
+                continue
+            seen_value_signatures.add(signature)
+            selected.append(column)
+        return selected
+
+    @staticmethod
+    def _has_explicit_rate_version(column: str, all_columns) -> bool:
+        candidates = {f"{column}/90", f"{column}90", f"{column}_per90"}
+        return any(candidate in all_columns for candidate in candidates)
+
+    def _is_administrative_column(self, column: str) -> bool:
+        normalized = re.sub(r"[^a-z0-9]+", "_", column.lower()).strip("_")
+        return any(
+            normalized == prefix or normalized.startswith(f"{prefix}_stats_")
+            for prefix in self.NON_FEATURE_PREFIXES
+        )
+
+    @staticmethod
+    def _is_rate_metric(column: str) -> bool:
+        normalized = column.lower()
+        return (
+            normalized in PlayerRecommender.RATE_METRIC_NAMES
+            or "%" in column
+            or "pct" in normalized
+            or "rate" in normalized
+            or "percent" in normalized
+            or "/90" in normalized
+            or "per90" in normalized
+            or "per_90" in normalized
+            or normalized.endswith("90")
+        )
+
+    @staticmethod
+    def feature_label(column: str) -> str:
+        label = column.replace("_per90", "").replace("_", " ").strip()
+        return re.sub(r"\s+", " ", label)
+
+    def get_features_for_position(self, position: Optional[str]) -> list:
+        if not position:
+            return self.feature_cols.copy()
+        selected = [
+            feature
+            for feature in self.feature_cols
+            if self.feature_position_coverage.get(feature, {}).get(position, 0)
+            >= self.MIN_POSITION_FEATURE_COVERAGE
+        ]
+        return selected or self.feature_cols.copy()
 
     def get_filtered_dataset(self, min_minutes_pct: float) -> pd.DataFrame:
         """
@@ -159,10 +241,33 @@ class PlayerRecommender:
         
         return df_filtered, sim_matrix
 
+    def compute_target_similarity(
+        self,
+        df_filtered: pd.DataFrame,
+        target_index: int,
+        feature_cols: Optional[list] = None,
+    ) -> Tuple[pd.DataFrame, np.ndarray]:
+        """Calculates similarity from one target to all players in O(N) memory."""
+        if df_filtered.empty or len(df_filtered) < 2:
+            return df_filtered, np.array([])
+
+        active_features = feature_cols or self.feature_cols
+        X = df_filtered[active_features].values
+        X_scaled = self.scaler.fit_transform(X)
+        distances = pairwise_distances(
+            X_scaled[target_index].reshape(1, -1),
+            X_scaled,
+            metric="euclidean",
+        )[0]
+        max_distance = np.sqrt(X_scaled.shape[1])
+        return df_filtered, np.clip(1 - (distances / max_distance), 0, 1)
+
     def find_similar_players(
         self, 
         player_name: str, 
         team_name: str, 
+        league_name: Optional[str] = None,
+        season: Optional[str] = None,
         min_minutes_pct: float = 20.0, 
         position_filter: Optional[str] = None,
         top_n: int = 50
@@ -173,10 +278,15 @@ class PlayerRecommender:
         # 1. Buscar al jugador objetivo en el dataset COMPLETO procesado (sin filtrar por minutos)
         df_all = self.df_processed.copy()
         
-        target_idx_list = df_all[
+        target_mask = (
             (df_all["player"].str.lower() == player_name.lower()) & 
             (df_all["team"].str.lower() == team_name.lower())
-        ].index
+        )
+        if league_name is not None:
+            target_mask &= df_all["league"].astype(str) == str(league_name)
+        if season is not None:
+            target_mask &= df_all["season"].astype(str) == str(season)
+        target_idx_list = df_all[target_mask].index
         
         if len(target_idx_list) == 0:
             target_idx_list = df_all[df_all["player"].str.lower() == player_name.lower()].index
@@ -203,18 +313,20 @@ class PlayerRecommender:
         # Encontrar la nueva posición del jugador objetivo en el dataframe consolidado
         new_target_idx_list = df_to_compare[
             (df_to_compare["player"] == target_player["player"]) & 
-            (df_to_compare["team"] == target_player["team"])
+            (df_to_compare["team"] == target_player["team"]) &
+            (df_to_compare["league"] == target_player["league"]) &
+            (df_to_compare["season"] == target_player["season"])
         ].index
         
         new_target_idx = new_target_idx_list[0]
         
         # 4. Calcular similitud
-        df_to_compare, sim_matrix = self.compute_similarity(df_to_compare)
-        if len(sim_matrix) == 0:
+        active_features = self.get_features_for_position(target_player["clean_position"])
+        df_to_compare, player_sims = self.compute_target_similarity(
+            df_to_compare, new_target_idx, feature_cols=active_features
+        )
+        if len(player_sims) == 0:
             return pd.DataFrame()
-            
-        # Obtener vector de similitudes para el jugador objetivo
-        player_sims = sim_matrix[new_target_idx]
         
         # Crear DataFrame de resultados
         results = df_to_compare.copy()
@@ -226,7 +338,9 @@ class PlayerRecommender:
         # Excluir al propio jugador buscado
         results = results[
             ~((results["player"] == target_player["player"]) & 
-              (results["team"] == target_player["team"]))
+              (results["team"] == target_player["team"]) &
+              (results["league"] == target_player["league"]) &
+              (results["season"] == target_player["season"]))
         ]
         
         # 5. Aplicar filtro de posición interactivo si se requiere
@@ -235,96 +349,3 @@ class PlayerRecommender:
             
         # Retornar el Top N
         return results.head(top_n)
-
-    def generate_openai_report(
-        self,
-        player_a: pd.Series,
-        player_b: pd.Series,
-        api_key: str
-    ) -> str:
-        """
-        Llama a la API de OpenAI para generar un reporte comparativo cualitativo detallado.
-        """
-        if not api_key:
-            return "Configura una API Key válida de OpenAI en el archivo .env para generar el reporte táctico."
-
-        # Construir un resumen estadístico comparativo para el prompt
-        # Seleccionamos algunas estadísticas clave de alto impacto
-        stats_to_compare = []
-        
-        # Buscar métricas relevantes disponibles en las características
-        key_keywords = [
-            "goal", "assist", "xg", "xa", "pass_cmp", "tkl", "int", "dribble", 
-            "shot", "carry", "key_pass", "prg", "clearance"
-        ]
-        
-        seen_base_names = set()
-        for col in self.feature_cols:
-            col_lower = col.lower()
-            # Encontrar el nombre original sin '_per90'
-            base_name = col.replace("_per90", "")
-            if any(kw in col_lower for kw in key_keywords) and base_name not in seen_base_names:
-                val_a = player_a[col]
-                val_b = player_b[col]
-                # Guardar si alguno de los dos tiene valores mayores a 0
-                if val_a > 0 or val_b > 0:
-                    stats_to_compare.append({
-                        "metric": base_name,
-                        "player_a": f"{val_a:.2f}",
-                        "player_b": f"{val_b:.2f}"
-                    })
-                    seen_base_names.add(base_name)
-
-        stats_summary = "\n".join([
-            f"- {s['metric']}: {player_a['player']} = {s['player_a']} | {player_b['player']} = {s['player_b']}"
-            for s in stats_to_compare[:15] # Limitar a las 15 más relevantes para ahorrar tokens
-        ])
-
-        prompt = f"""
-Eres un analista de datos de fútbol profesional y un cazatalentos (scout).
-Tu tarea es realizar un informe comparativo táctico de dos jugadores basándote en sus estadísticas de rendimiento de la temporada.
-
-Datos del Jugador A (Objetivo):
-- Nombre: {player_a['player']}
-- Equipo: {player_a['team']}
-- Liga: {player_a['league']}
-- Posición: {player_a['clean_position']} ({player_a['position']})
-- Edad: {player_a.get('age', 'Desconocida')} años
-- Minutos Jugados: {player_a['minutes']} mins
-
-Datos del Jugador B (Candidato Similar):
-- Nombre: {player_b['player']}
-- Equipo: {player_b['team']}
-- Liga: {player_b['league']}
-- Posición: {player_b['clean_position']} ({player_b['position']})
-- Edad: {player_b.get('age', 'Desconocida')} años
-- Minutos Jugados: {player_b['minutes']} mins
-- Similitud Matemática Calculada: {player_b['similarity'] * 100:.1f}%
-- Método de Similitud: distancia euclídea sobre métricas normalizadas entre 0 y 1.
-
-Estadísticas Comparativas Clave (Normalizadas por 90 minutos de juego):
-{stats_summary}
-
-Escribe un reporte premium estructurado en los siguientes puntos (redactado en español):
-1. **Perfil y Estilo de Juego**: Analiza brevemente cómo juega cada uno según sus estadísticas (si es más pasador, regateador, defensivo, finalizador, etc.).
-2. **Fortalezas y Similitudes Clave**: ¿En qué métricas tienen valores realmente cercanos y cuáles sostienen la puntuación de similitud?
-3. **Diferencias Tácticas**: Aunque son similares, ¿en qué aspectos se diferencian según los datos? (Ej. uno toma más riesgos, el otro es más eficiente en defensa, etc.).
-4. **Conclusión de Scouting**: Evalúa si el Jugador B sería un reemplazo/fichaje adecuado para el rol del Jugador A, considerando también su edad y liga.
-
-Sé conciso, analítico y profesional. Evita generalidades y usa las estadísticas provistas para justificar tus comentarios.
-"""
-        try:
-            client = OpenAI(api_key=api_key)
-            response = client.chat.completions.create(
-                model="gpt-4o-mini", # Usar gpt-4o-mini por eficiencia y bajo coste
-                messages=[
-                    {"role": "system", "content": "Eres un scout y analista de datos de fútbol profesional."},
-                    {"role": "user", "content": prompt}
-                ],
-                temperature=0.5,
-                max_tokens=1000
-            )
-            return response.choices[0].message.content
-        except Exception as e:
-            logger.error(f"Error al llamar a la API de OpenAI: {e}")
-            return f"Error al generar el reporte táctico con la IA: {e}. Comprueba tu clave de API."
