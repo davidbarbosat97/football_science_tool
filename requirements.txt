@@ -1,0 +1,9 @@
+soccerdata
+streamlit
+pandas
+numpy
+scikit-learn
+openai
+plotly
+pyarrow
+python-dotenv
