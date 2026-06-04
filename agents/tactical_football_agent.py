@@ -79,6 +79,7 @@ Datos del Jugador A (Objetivo):
 - Liga: {player_a['league']}
 - Posición: {player_a['clean_position']} ({player_a['position']})
 - Edad: {player_a.get('age', 'Desconocida')} años
+- Nacionalidad: {player_a.get('nation', 'Desconocida')}
 - Minutos Jugados: {player_a['minutes']} mins
 
 Datos del Jugador B (Candidato Similar):
@@ -87,6 +88,7 @@ Datos del Jugador B (Candidato Similar):
 - Liga: {player_b['league']}
 - Posición: {player_b['clean_position']} ({player_b['position']})
 - Edad: {player_b.get('age', 'Desconocida')} años
+- Nacionalidad: {player_b.get('nation', 'Desconocida')}
 - Minutos Jugados: {player_b['minutes']} mins
 - Similitud Matemática Calculada: {player_b['similarity'] * 100:.1f}%
 - Método de Similitud: distancia euclídea sobre métricas normalizadas entre 0 y 1.

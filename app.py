@@ -10,6 +10,24 @@ from src.data_loader import DatasetValidationError, PlayerDatasetNormalizer
 from src.scraper import get_scraper
 from src.recommender import PlayerRecommender
 
+DATA_NORMALIZATION_VERSION = 2
+
+
+def format_age(value) -> str:
+    numeric_value = pd.to_numeric(value, errors="coerce")
+    if pd.notna(numeric_value) and float(numeric_value).is_integer():
+        return str(int(numeric_value))
+    if pd.isna(value) or str(value).strip() in {"", "nan", "None"}:
+        return "N/A"
+    return str(value).strip()
+
+
+def format_nation(value) -> str:
+    if pd.isna(value) or str(value).strip() in {"", "nan", "None"}:
+        return "N/A"
+    return str(value).strip()
+
+
 # Cargar variables de entorno del archivo .env
 load_dotenv()
 
@@ -216,13 +234,20 @@ def load_data(prov: str, leagues: list, seas: str, reload: bool = False) -> pd.D
     return scraper.load_season_data(seas, force_refresh=reload)
 
 @st.cache_data(show_spinner=False)
-def load_csv_data(file_bytes: bytes, default_season: str) -> pd.DataFrame:
+def load_csv_data(
+    file_bytes: bytes, default_season: str, normalization_version: int
+) -> pd.DataFrame:
     return PlayerDatasetNormalizer.read_csv(
         BytesIO(file_bytes), default_season=default_season
     )
 
 @st.cache_data(show_spinner=False)
-def load_local_csv_data(path: str, modified_at: float, default_season: str) -> pd.DataFrame:
+def load_local_csv_data(
+    path: str,
+    modified_at: float,
+    default_season: str,
+    normalization_version: int,
+) -> pd.DataFrame:
     return PlayerDatasetNormalizer.read_csv(path, default_season=default_season)
 
 # Estado de carga de datos
@@ -232,10 +257,15 @@ with st.spinner("Cargando y procesando la base de datos de futbolistas..."):
             df = load_data("Understat", selected_leagues, season, reload=force_reload)
         elif data_source == "CSV local" and local_csv_path:
             df = load_local_csv_data(
-                local_csv_path, os.path.getmtime(local_csv_path), csv_season
+                local_csv_path,
+                os.path.getmtime(local_csv_path),
+                csv_season,
+                DATA_NORMALIZATION_VERSION,
             )
         elif uploaded_csv is not None:
-            df = load_csv_data(uploaded_csv.getvalue(), csv_season)
+            df = load_csv_data(
+                uploaded_csv.getvalue(), csv_season, DATA_NORMALIZATION_VERSION
+            )
         else:
             df = pd.DataFrame()
 
@@ -293,6 +323,8 @@ else:
     target_row = df_search[df_search["search_display"] == selected_search].iloc[0]
     target_name = target_row["player"]
     target_team = target_row["team"]
+    target_age = format_age(target_row.get("age", "N/A"))
+    target_nation = format_nation(target_row.get("nation", "N/A"))
     
     # Mostrar tarjeta del jugador seleccionado
     st.markdown("#### Jugador Seleccionado")
@@ -301,7 +333,7 @@ else:
         st.markdown(f"""
         <div class="metric-card">
             <div class="metric-card-title">Jugador</div>
-            <div class="metric-card-value">{target_name}</div>
+            <div class="metric-card-value">{target_name}<br><small style="color:gray;">{target_nation}</small></div>
         </div>
         """, unsafe_allow_html=True)
     with c2:
@@ -315,7 +347,7 @@ else:
         st.markdown(f"""
         <div class="metric-card">
             <div class="metric-card-title">Posición / Edad</div>
-            <div class="metric-card-value">{target_row['clean_position']} <span style="font-size:1rem; font-weight:normal;">({target_row.get('age', 'N/A')} años)</span></div>
+            <div class="metric-card-value">{target_row['clean_position']} <span style="font-size:1rem; font-weight:normal;">({target_age} años)</span></div>
         </div>
         """, unsafe_allow_html=True)
     with c4:
@@ -360,7 +392,10 @@ else:
         display_df["Similitud (%)"] = (display_df["similarity"] * 100).round(1)
         display_df["Edad"] = display_df.get(
             "age", pd.Series("N/A", index=display_df.index)
-        ).fillna("N/A")
+        ).apply(format_age)
+        display_df["Nacionalidad"] = display_df.get(
+            "nation", pd.Series("N/A", index=display_df.index)
+        ).apply(format_nation)
         display_df["Minutos"] = display_df["minutes"].astype(int)
         display_df["Partidos"] = display_df["matches"].astype(int)
         
@@ -370,7 +405,7 @@ else:
         
         # Mostrar tabla interactiva
         st.dataframe(
-            display_df[["player", "team", "league", "clean_position", "Edad", "Minutos", "Partidos", "Similitud (%)"]].rename(columns={
+            display_df[["player", "team", "league", "clean_position", "Edad", "Nacionalidad", "Minutos", "Partidos", "Similitud (%)"]].rename(columns={
                 "player": "Jugador",
                 "team": "Equipo",
                 "league": "Liga",
